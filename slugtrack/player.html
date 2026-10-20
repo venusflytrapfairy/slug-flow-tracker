@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #E9EDEC;
+    --panel: #F6F8F7;
+    --ink: #1B2A33;
+    --ink-2: #4B5B64;
+    --ink-3: #7D8B92;
+    --rule: #C9D2D0;
+    --stage: #10181D;
+    --cobalt: #2357C6;
+    --focus: #2357C6;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink);
+    font-family: "Archivo", system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+  .wrap { display: grid; grid-template-columns: minmax(0, 1fr) 232px; gap: 14px; padding: 2px 2px 8px; }
+  @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } }
+
+  .stage { position: relative; background: var(--stage); border-radius: 6px; overflow: hidden; aspect-ratio: var(--ar, 2 / 1); }
+  .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .buffer { position: absolute; left: 12px; bottom: 10px; color: #C9D6DC; font-size: 12px; letter-spacing: .01em; }
+
+  .readouts { display: flex; flex-direction: column; gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; }
+  .card .k { font-size: 12.5px; color: var(--ink-2); margin: 0 0 2px; }
+  .count { font-stretch: 125%; font-weight: 800; font-size: 64px; line-height: .95; letter-spacing: -.02em; }
+  .count small { font-stretch: 100%; font-weight: 500; font-size: 14px; color: var(--ink-2); letter-spacing: 0; margin-left: 4px; }
+  .v { font-stretch: 112%; font-weight: 700; font-size: 22px; line-height: 1.15; }
+  .v small { font-stretch: 100%; font-weight: 500; font-size: 13px; color: var(--ink-2); }
+  .sub { font-size: 12.5px; color: var(--ink-3); margin-top: 2px; }
+  .chip { display: inline-flex; align-items: center; gap: 7px; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+
+  .transport { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  button, select { font: inherit; font-size: 14px; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--rule); border-radius: 6px; height: 36px; padding: 0 12px; cursor: pointer; }
+  button.play { background: var(--ink); color: #fff; border-color: var(--ink); min-width: 92px; font-weight: 600; }
+  button:hover { border-color: var(--ink-2); }
+  button:focus-visible, select:focus-visible, input:focus-visible, canvas:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .scrub { flex: 1 1 260px; min-width: 180px; accent-color: var(--ink); }
+  .flabel { font-size: 13px; color: var(--ink-2); min-width: 150px; text-align: right; }
+  .toggles { display: flex; gap: 14px; font-size: 13px; color: var(--ink-2); }
+  .toggles label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
+
+  .kymo { grid-column: 1 / -1; background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px 6px; }
+  .kymo-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .kymo-head h3 { margin: 0; font-size: 15px; font-weight: 700; font-stretch: 108%; }
+  .kymo-head p { margin: 0; font-size: 12.5px; color: var(--ink-2); max-width: 72ch; }
+  #kymo { width: 100%; height: 210px; display: block; margin-top: 6px; cursor: crosshair; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2); padding: 4px 0 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="stage" id="stage"><canvas id="view" aria-label="Frame with slug detections"></canvas><div class="buffer" id="buffer"></div></div>
+
+  <div class="readouts">
+    <div class="card">
+      <p class="k">Slugs counted so far</p>
+      <div class="count"><span id="soFar">0</span><small>of <span id="total">0</span></small></div>
+    </div>
+    <div class="card">
+      <p class="k">In view now</p>
+      <div class="v" id="inView">None</div>
+      <div class="sub" id="conf">&nbsp;</div>
+    </div>
+    <div class="card">
+      <p class="k">Front speed</p>
+      <div class="v" id="speed">&ndash;</div>
+      <div class="sub" id="speed2">&nbsp;</div>
+    </div>
+    <div class="card">
+      <p class="k">Visible slug length</p>
+      <div class="v" id="len">&ndash;</div>
+      <div class="sub" id="interval">&nbsp;</div>
+    </div>
+  </div>
+
+  <div class="transport">
+    <button class="play" id="play" aria-label="Play">Play</button>
+    <button id="prev" aria-label="Previous frame">&lsaquo;</button>
+    <button id="next" aria-label="Next frame">&rsaquo;</button>
+    <select id="rate" aria-label="Playback speed">
+      <option value="6">6 frames/s</option>
+      <option value="12" selected>12 frames/s</option>
+      <option value="24">24 frames/s</option>
+      <option value="48">48 frames/s</option>
+    </select>
+    <input class="scrub" id="scrub" type="range" min="0" value="0" step="1" aria-label="Frame">
+    <span class="flabel" id="flabel"></span>
+    <div class="toggles">
+      <label><input type="checkbox" id="tBoxes" checked> Boxes</label>
+      <label><input type="checkbox" id="tTrail" checked> Front trail</label>
+      <label><input type="checkbox" id="tScale" checked> Scale bar</label>
+    </div>
+  </div>
+
+  <div class="kymo">
+    <div class="kymo-head">
+      <h3>Space&ndash;time diagram</h3>
+      <p>Each band is one slug: its height is where the slug body sits along the pipe, its lower edge is the front. A steeper slope means a faster slug. Click to jump to a frame.</p>
+    </div>
+    <canvas id="kymo" tabindex="0" aria-label="Space-time diagram of slug positions"></canvas>
+    <div class="legend" id="legend"></div>
+  </div>
+</div>
+
+<script>
+const D = __DATA__;
+const COLORS = ["#2357C6", "#C98A12", "#13836F", "#8A3B8F", "#C2412D", "#4F6D7A"];
+const colorOf = s => COLORS[(s - 1) % COLORS.length];
+const N = D.frames.length, W = D.width, H = D.height;
+const PXCM = D.px_per_cm, FPS = D.fps;
+const slugById = Object.fromEntries(D.slugs.map(s => [s.slug, s]));
+document.getElementById("stage").style.setProperty("--ar", `${W} / ${H}`);
+document.getElementById("total").textContent = D.slugs.length;
+
+// slugs that have appeared by image i
+const firstIdx = D.slugs.map(s => s.first_idx);
+const soFarAt = i => firstIdx.filter(f => f <= i).length;
+
+// ---------- image preloading ----------
+const imgs = new Array(N); let loaded = 0;
+const bufEl = document.getElementById("buffer");
+function loadImg(i) {
+  const im = new Image();
+  im.decoding = "async";
+  im.onload = () => { loaded++; bufEl.textContent = loaded < N ? `Loading frames ${loaded}/${N}` : ""; if (i === cur) draw(); };
+  im.onerror = () => { if (!im.dataset.retry) { im.dataset.retry = 1; im.src = "/" + D.frames[i].url; } };
+  im.src = D.frames[i].url;
+  imgs[i] = im;
+}
+for (let i = 0; i < N; i++) loadImg(i);
+
+// ---------- state ----------
+let cur = 0, playing = false, last = 0;
+const KEY = "slugplayer:" + D.dataset_id;
+try { const s = localStorage.getItem(KEY); if (s !== null) cur = Math.min(+s, N - 1) || 0; } catch (e) {}
+
+const view = document.getElementById("view"), vctx = view.getContext("2d");
+const kymo = document.getElementById("kymo"), kctx = kymo.getContext("2d");
+const scrub = document.getElementById("scrub"); scrub.max = N - 1;
+
+function fitCanvas(c) {
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  return dpr;
+}
+
+// ---------- frame view ----------
+function draw() {
+  const dpr = fitCanvas(view);
+  const cw = view.width, ch = view.height, sx = cw / W, sy = ch / H;
+  vctx.clearRect(0, 0, cw, ch);
+  const im = imgs[cur];
+  if (im && im.complete && im.naturalWidth) vctx.drawImage(im, 0, 0, cw, ch);
+
+  const fr = D.frames[cur];
+  if (document.getElementById("tTrail").checked) {
+    for (const b of fr.boxes) {
+      const s = slugById[b.slug]; if (!s) continue;
+      const yMid = (b.y1 + b.y2) / 2 * sy;
+      const pts = s.track.filter(p => p.idx <= cur && p.idx > cur - 40);
+      pts.forEach((p, k) => {
+        vctx.globalAlpha = 0.15 + 0.85 * (k + 1) / pts.length;
+        vctx.fillStyle = colorOf(b.slug);
+        vctx.beginPath(); vctx.arc(p.front * sx, yMid, 3 * dpr, 0, Math.PI * 2); vctx.fill();
+      });
+      vctx.globalAlpha = 1;
+    }
+  }
+  if (document.getElementById("tBoxes").checked) {
+    for (const b of fr.boxes) {
+      const c = colorOf(b.slug);
+      const x = b.x1 * sx, y = b.y1 * sy, w = (b.x2 - b.x1) * sx, h = (b.y2 - b.y1) * sy;
+      vctx.lineWidth = 2.5 * dpr; vctx.strokeStyle = c; vctx.strokeRect(x, y, w, h);
+      // front marker
+      vctx.beginPath(); vctx.moveTo(x, y - 10 * dpr); vctx.lineTo(x, y + h + 10 * dpr); vctx.stroke();
+      vctx.beginPath(); vctx.moveTo(x - 8 * dpr, y - 10 * dpr); vctx.lineTo(x, y - 15 * dpr); vctx.lineTo(x, y - 5 * dpr); vctx.closePath();
+      vctx.fillStyle = c; vctx.fill();
+      // label
+      const label = `Slug ${b.slug}  ${b.conf.toFixed(2)}`;
+      vctx.font = `600 ${13 * dpr}px Archivo, sans-serif`;
+      const tw = vctx.measureText(label).width + 12 * dpr;
+      const lx = Math.min(Math.max(x, 0), cw - tw), ly = Math.max(y - 26 * dpr, 2 * dpr);
+      vctx.fillStyle = c; vctx.fillRect(lx, ly, tw, 20 * dpr);
+      vctx.fillStyle = "#fff"; vctx.fillText(label, lx + 6 * dpr, ly + 14.5 * dpr);
+    }
+  }
+  if (document.getElementById("tScale").checked && PXCM) {
+    const len = 10 * PXCM * sx, x0 = cw - len - 16 * dpr, y0 = ch - 18 * dpr;
+    vctx.fillStyle = "rgba(16,24,29,.65)"; vctx.fillRect(x0 - 8 * dpr, y0 - 22 * dpr, len + 16 * dpr, 32 * dpr);
+    vctx.strokeStyle = "#fff"; vctx.lineWidth = 2 * dpr;
+    vctx.beginPath(); vctx.moveTo(x0, y0); vctx.lineTo(x0 + len, y0); vctx.moveTo(x0, y0 - 5 * dpr); vctx.lineTo(x0, y0 + 5 * dpr);
+    vctx.moveTo(x0 + len, y0 - 5 * dpr); vctx.lineTo(x0 + len, y0 + 5 * dpr); vctx.stroke();
+    vctx.fillStyle = "#fff"; vctx.font = `500 ${12 * dpr}px Archivo, sans-serif`; vctx.fillText("10 cm", x0, y0 - 9 * dpr);
+  }
+  // flow direction hint
+  vctx.font = `500 ${12 * dpr}px Archivo, sans-serif`;
+  const fw = vctx.measureText("← Flow").width + 16 * dpr;
+  vctx.fillStyle = "rgba(16,24,29,.65)"; vctx.fillRect(12 * dpr, 10 * dpr, fw, 22 * dpr);
+  vctx.fillStyle = "#fff"; vctx.fillText("← Flow", 20 * dpr, 25 * dpr);
+
+  updateReadouts(); drawKymo();
+  scrub.value = cur;
+  try { localStorage.setItem(KEY, cur); } catch (e) {}
+}
+
+function fmt(v, d = 2) { return v == null ? "–" : v.toFixed(d); }
+
+function updateReadouts() {
+  const fr = D.frames[cur];
+  document.getElementById("soFar").textContent = soFarAt(cur);
+  document.getElementById("flabel").textContent = `Frame ${fr.frame}  (${cur + 1}/${N})`;
+  const segInfo = D.segments[fr.segment];
+  document.getElementById("interval").textContent =
+    `Interval ${fr.segment + 1} of ${D.segments.length}: frames ${segInfo.first}–${segInfo.last}`;
+  const inView = document.getElementById("inView"), conf = document.getElementById("conf");
+  if (!fr.boxes.length) {
+    inView.textContent = "None"; conf.innerHTML = fr.rejected ? "Low-confidence box ignored" : "&nbsp;";
+    document.getElementById("speed").textContent = "–"; document.getElementById("speed2").innerHTML = "&nbsp;";
+    document.getElementById("len").textContent = "–";
+    return;
+  }
+  inView.innerHTML = fr.boxes.map(b => `<span class="chip"><span class="dot" style="background:${colorOf(b.slug)}"></span>Slug ${b.slug}</span>`).join(" ");
+  conf.textContent = `Detector confidence ${fr.boxes.map(b => b.conf.toFixed(2)).join(", ")}`;
+  const b = fr.boxes[0], s = slugById[b.slug];
+  const v = s.front_velocity_px_per_frame;
+  if (v == null) {
+    document.getElementById("speed").textContent = "Measuring";
+    document.getElementById("speed2").textContent = "Needs the front in view for 3 frames";
+  } else {
+    const cmf = Math.abs(v) / PXCM;
+    document.getElementById("speed").innerHTML = FPS ? `${fmt(cmf * FPS, 1)} <small>cm/s</small>` : `${fmt(cmf)} <small>cm/frame</small>`;
+    document.getElementById("speed2").textContent = FPS ? `${fmt(cmf)} cm/frame at ${FPS} fps` : `${fmt(Math.abs(v), 1)} px/frame, moving left`;
+  }
+  const lcm = (b.x2 - b.x1) / PXCM;
+  const clipped = b.x2 >= W - 6 || b.x1 <= 6;
+  document.getElementById("len").innerHTML = `${fmt(lcm, 1)} <small>cm${clipped ? ", cut by frame edge" : ""}</small>`;
+}
+
+// ---------- space-time diagram ----------
+let kymoBase = null;
+function buildKymoBase() {
+  const dpr = fitCanvas(kymo);
+  const cw = kymo.width, ch = kymo.height;
+  const padL = 46 * dpr, padR = 8 * dpr, padT = 6 * dpr, padB = 24 * dpr;
+  const pw = cw - padL - padR, ph = ch - padT - padB;
+  const off = document.createElement("canvas"); off.width = cw; off.height = ch;
+  const c = off.getContext("2d");
+  const X = i => padL + (i + 0.5) / N * pw;
+  const Y = px => padT + ph - (px / W) * ph;          // 0 = left edge of view (bottom)
+  const colW = Math.max(pw / N, 1);
+  c.fillStyle = "#FBFCFC"; c.fillRect(padL, padT, pw, ph);
+  // gaps between sampled intervals
+  for (let i = 1; i < N; i++) {
+    if (D.frames[i].segment !== D.frames[i - 1].segment) {
+      const x = padL + i / N * pw;
+      c.save(); c.beginPath(); c.rect(x - 3 * dpr, padT, 6 * dpr, ph); c.clip();
+      c.strokeStyle = "#9AA8AE"; c.lineWidth = 1 * dpr;
+      for (let k = -ph; k < ph; k += 5 * dpr) { c.beginPath(); c.moveTo(x - 3 * dpr, padT + k); c.lineTo(x + 3 * dpr, padT + k + 6 * dpr); c.stroke(); }
+      c.restore();
+    } else if (D.frames[i].frame - D.frames[i - 1].frame > 1) {
+      const x = padL + i / N * pw;
+      c.fillStyle = "#B7C2C6"; c.fillRect(x - 0.5 * dpr, padT + ph, 1 * dpr, 5 * dpr);
+    }
+  }
+  // slug bodies: one filled polygon per slug per run of consecutive images
+  for (const s of D.slugs) {
+    const pts = [];
+    for (let i = s.first_idx; i <= s.last_idx; i++) {
+      const b = D.frames[i].boxes.find(q => q.slug === s.slug);
+      pts.push(b ? { i, b } : null);
+    }
+    const runs = []; let run = [];
+    for (const p of pts) { if (p) run.push(p); else if (run.length) { runs.push(run); run = []; } }
+    if (run.length) runs.push(run);
+    c.fillStyle = colorOf(s.slug); c.globalAlpha = 0.24;
+    for (const r of runs) {
+      c.beginPath();
+      const L = X(r[0].i) - colW / 2, R = X(r[r.length - 1].i) + colW / 2;
+      r.forEach((p, k) => { const x = k === 0 ? L : X(p.i); k ? c.lineTo(x, Y(p.b.x2)) : c.moveTo(x, Y(p.b.x2)); });
+      c.lineTo(R, Y(r[r.length - 1].b.x2)); c.lineTo(R, Y(r[r.length - 1].b.x1));
+      for (let k = r.length - 1; k >= 0; k--) c.lineTo(k === 0 ? L : X(r[k].i), Y(r[k].b.x1));
+      c.closePath(); c.fill();
+    }
+  }
+  c.globalAlpha = 1;
+  for (const s of D.slugs) {
+    c.strokeStyle = colorOf(s.slug); c.lineWidth = 2 * dpr; c.beginPath();
+    s.track.forEach((p, k) => { const x = X(p.idx), y = Y(p.front); k ? c.lineTo(x, y) : c.moveTo(x, y); });
+    c.stroke();
+  }
+  // axes
+  c.fillStyle = "#4B5B64"; c.font = `500 ${11 * dpr}px Archivo, sans-serif`; c.textAlign = "right";
+  const totalCm = W / PXCM;
+  for (let cm = 0; cm <= totalCm; cm += 20) {
+    const y = Y(cm * PXCM);
+    c.fillText(`${cm}`, padL - 6 * dpr, y + 4 * dpr);
+    c.fillStyle = "#E1E6E5"; c.fillRect(padL, y, pw, 1 * dpr); c.fillStyle = "#4B5B64";
+  }
+  c.save(); c.translate(12 * dpr, padT + ph / 2); c.rotate(-Math.PI / 2); c.textAlign = "center";
+  c.fillText("position, cm", 0, 0); c.restore();
+  c.textAlign = "left";
+  // interval labels under the axis
+  D.segments.forEach((sg, k) => {
+    const x0 = padL + sg.first_idx / N * pw;
+    c.fillText(`${sg.first}–${sg.last}`, x0 + 4 * dpr, ch - 7 * dpr);
+  });
+  kymoBase = { off, padL, padT, pw, ph, dpr };
+}
+function drawKymo() {
+  if (!kymoBase || kymoBase.off.width !== Math.round(kymo.getBoundingClientRect().width * (window.devicePixelRatio || 1))) buildKymoBase();
+  const { off, padL, padT, pw, ph, dpr } = kymoBase;
+  kctx.clearRect(0, 0, kymo.width, kymo.height);
+  kctx.drawImage(off, 0, 0);
+  const x = padL + (cur + 0.5) / N * pw;
+  kctx.fillStyle = "#1B2A33"; kctx.fillRect(x - 1 * dpr, padT, 2 * dpr, ph);
+  kctx.beginPath(); kctx.moveTo(x - 5 * dpr, padT); kctx.lineTo(x + 5 * dpr, padT); kctx.lineTo(x, padT + 7 * dpr); kctx.fill();
+}
+function kymoSeek(ev) {
+  const r = kymo.getBoundingClientRect(), { padL, pw, dpr } = kymoBase;
+  const x = (ev.clientX - r.left) * dpr;
+  cur = Math.max(0, Math.min(N - 1, Math.floor((x - padL) / pw * N)));
+  draw();
+}
+let dragging = false;
+kymo.addEventListener("mousedown", e => { dragging = true; kymoSeek(e); });
+window.addEventListener("mousemove", e => { if (dragging) kymoSeek(e); });
+window.addEventListener("mouseup", () => dragging = false);
+
+// legend
+document.getElementById("legend").innerHTML = D.slugs.map(s =>
+  `<span class="chip"><span class="dot" style="background:${colorOf(s.slug)}"></span>Slug ${s.slug}: frames ${s.first_frame}–${s.last_frame}</span>`).join("") +
+  (D.segments.length > 1 ? `<span class="chip"><span class="dot" style="background:repeating-linear-gradient(45deg,#9AA8AE 0 2px,#FBFCFC 2px 4px)"></span>Gap between sampled intervals</span>` : "");
+
+// ---------- transport ----------
+const playBtn = document.getElementById("play");
+function setPlaying(p) { playing = p; playBtn.textContent = p ? "Pause" : "Play"; playBtn.setAttribute("aria-label", p ? "Pause" : "Play"); if (p) { last = 0; requestAnimationFrame(tick); } }
+function tick(t) {
+  if (!playing) return;
+  const step = 1000 / +document.getElementById("rate").value;
+  if (!last) last = t;
+  if (t - last >= step) {
+    const nxt = cur + 1;
+    if (nxt >= N) { setPlaying(false); return; }
+    const im = imgs[nxt];
+    if (im && im.complete) { cur = nxt; last = t; draw(); }
+  }
+  requestAnimationFrame(tick);
+}
+playBtn.onclick = () => { if (!playing && cur >= N - 1) cur = 0; setPlaying(!playing); };
+document.getElementById("prev").onclick = () => { setPlaying(false); cur = Math.max(0, cur - 1); draw(); };
+document.getElementById("next").onclick = () => { setPlaying(false); cur = Math.min(N - 1, cur + 1); draw(); };
+scrub.oninput = () => { cur = +scrub.value; draw(); };
+["tBoxes", "tTrail", "tScale"].forEach(id => document.getElementById(id).onchange = draw);
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); playBtn.click(); }
+  else if (e.code === "ArrowRight") { e.preventDefault(); document.getElementById("next").click(); }
+  else if (e.code === "ArrowLeft") { e.preventDefault(); document.getElementById("prev").click(); }
+});
+window.addEventListener("resize", () => { kymoBase = null; draw(); });
+document.fonts && document.fonts.ready.then(() => { kymoBase = null; draw(); });
+draw();
+</script>
+</body>
+</html>

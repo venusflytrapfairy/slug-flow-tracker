@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+static/demo/
+static/sessions/
+data/demo_frames/
+.pytest_cache/
