@@ -1,13 +1,13 @@
 """Glue between data sources, detector, tracker, metrics and the player."""
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import time
 import uuid
-from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -26,6 +26,8 @@ WEIGHTS = ROOT / "models" / "slug_yolov8s_500img.pt"
 SESSIONS = STATIC / "sessions"
 MAX_WIDTH = 960          # frames are shown (and detected) at most this wide
 WEB_QUALITY = 78
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+LOCAL_CACHE_VERSION = 1
 
 
 # ---------------------------------------------------------------- frames
@@ -37,7 +39,8 @@ def to_web_jpeg(img: np.ndarray, dest: Path) -> Tuple[np.ndarray, Tuple[int, int
         img = cv2.resize(img, (MAX_WIDTH, round(h * MAX_WIDTH / w)), interpolation=cv2.INTER_AREA)
     gray_like = img.ndim == 2 or np.allclose(img[..., 0], img[..., 1], atol=3)
     out = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if (img.ndim == 3 and gray_like) else img
-    cv2.imwrite(str(dest), out, [cv2.IMWRITE_JPEG_QUALITY, WEB_QUALITY])
+    if not cv2.imwrite(str(dest), out, [cv2.IMWRITE_JPEG_QUALITY, WEB_QUALITY]):
+        raise OSError(f"Could not write processed frame to {dest}.")
     return img, (img.shape[1], img.shape[0])
 
 
@@ -54,7 +57,8 @@ def cleanup_sessions(max_age_s: int = 3 * 3600) -> None:
     now = time.time()
     for d in SESSIONS.iterdir():
         try:
-            if d.is_dir() and now - d.stat().st_mtime > max_age_s:
+            if (d.is_dir() and not d.name.startswith("local-")
+                    and now - d.stat().st_mtime > max_age_s):
                 shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
@@ -144,6 +148,198 @@ def load_uploaded_images(files: Sequence, detector: SlugDetector,
     return {"id": sdir.name, "names": names,
             "frame_numbers": _monotonic([frame_number(n, i) for i, n in enumerate(names)]),
             "detections": dets, "urls": urls, "size": size, "fps": None, "kind": "images"}
+
+
+def scan_image_folder(folder: str | Path) -> Tuple[Path, List[Path], str]:
+    """Return naturally sorted supported images and a fingerprint for a local folder."""
+    candidate = Path(folder).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError(f"Enter an absolute path to the image folder: {folder}")
+    try:
+        root = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Image folder does not exist or cannot be accessed: {folder}") from exc
+    if not root.is_dir():
+        raise ValueError(f"Image path is not a folder: {root}")
+
+    try:
+        paths = [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES]
+        metadata = [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
+    except OSError as exc:
+        raise ValueError(f"Could not read the image folder: {root}") from exc
+
+    paths = [root / name for name in natural_sort([item[0] for item in metadata])]
+    by_name = {item[0]: item[1:] for item in metadata}
+    ordered_metadata = [(p.name, *by_name[p.name]) for p in paths]
+    weights_stat = WEIGHTS.stat()
+    signature = json.dumps(
+        {
+            "version": LOCAL_CACHE_VERSION,
+            "folder": str(root),
+            "files": ordered_metadata,
+            "weights": (weights_stat.st_size, weights_stat.st_mtime_ns),
+            "max_width": MAX_WIDTH,
+            "web_quality": WEB_QUALITY,
+        },
+        separators=(",", ":"),
+    ).encode()
+    return root, paths, hashlib.sha256(signature).hexdigest()
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(value, separators=(",", ":")))
+    temp.replace(path)
+
+
+def load_local_image_folder(
+    folder: str | Path,
+    detector: SlugDetector,
+    limit: Optional[int] = None,
+    batch_size: int = 8,
+    progress: Optional[Callable[[float, str], None]] = None,
+) -> Dict:
+    """Detect a local image sequence incrementally and persist reusable checkpoints."""
+    if batch_size < 1:
+        raise ValueError("Batch size must be at least 1.")
+    root, paths, fingerprint = scan_image_folder(folder)
+    if not paths:
+        raise ValueError(f"No supported images were found in {root}.")
+    target = min(limit, len(paths)) if limit is not None else len(paths)
+    if target < 1:
+        raise ValueError("There are no images selected for processing.")
+
+    cache_id = "local-" + fingerprint[:20]
+    sdir = SESSIONS / cache_id
+    sdir.mkdir(parents=True, exist_ok=True)
+    manifest_path = sdir / "detections.json"
+    frame_numbers = _monotonic([frame_number(p.name, i) for i, p in enumerate(paths)])
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"The saved processing cache is unreadable: {manifest_path}. "
+                "Remove that cache file and run again."
+            ) from exc
+        if manifest.get("fingerprint") != fingerprint:
+            raise ValueError("The saved processing cache does not match the selected image folder.")
+    else:
+        manifest = {
+            "version": LOCAL_CACHE_VERSION,
+            "fingerprint": fingerprint,
+            "names": [p.name for p in paths],
+            "frame_numbers": frame_numbers,
+            "chunks": [],
+            "completed_frames": 0,
+            "size": None,
+            "detection_seconds": 0.0,
+            "pilot_detection_seconds": 0.0,
+        }
+        _write_json_atomic(manifest_path, manifest)
+
+    if manifest.get("names") != [p.name for p in paths] or manifest.get("frame_numbers") != frame_numbers:
+        raise ValueError("The saved processing cache does not match the selected image sequence.")
+    completed = int(manifest.get("completed_frames", 0))
+    chunks = manifest.get("chunks", [])
+    detections = []
+    expected_start = 0
+    try:
+        for chunk in chunks:
+            if chunk["start"] != expected_start or chunk["stop"] <= chunk["start"]:
+                raise ValueError("non-contiguous cache chunks")
+            chunk_detections = json.loads((sdir / chunk["file"]).read_text())
+            if len(chunk_detections) != chunk["stop"] - chunk["start"]:
+                raise ValueError("cache chunk length mismatch")
+            detections.extend(chunk_detections)
+            expected_start = chunk["stop"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"The saved processing cache is incomplete or invalid: {manifest_path}.") from exc
+    if completed != len(detections) or completed != expected_start or completed > len(paths):
+        raise ValueError(f"The saved processing cache is incomplete or invalid: {manifest_path}.")
+    size = tuple(manifest["size"]) if manifest.get("size") else None
+    if any(not (sdir / f"{i:06d}.jpg").is_file() for i in range(completed)):
+        completed = 0
+        detections = []
+        size = None
+        manifest.update({
+            "chunks": [],
+            "completed_frames": 0,
+            "size": None,
+            "detection_seconds": 0.0,
+            "pilot_detection_seconds": 0.0,
+        })
+        _write_json_atomic(manifest_path, manifest)
+
+    cached_images = min(completed, target)
+    started = time.monotonic()
+    if size is None:
+        first = cv2.imread(str(paths[0]), cv2.IMREAD_COLOR)
+        if first is None:
+            raise ValueError(f"{paths[0].name} could not be read as an image.")
+        h, w = first.shape[:2]
+        if w > MAX_WIDTH:
+            h, w = round(h * MAX_WIDTH / w), MAX_WIDTH
+        size = (w, h)
+
+    while completed < target:
+        stop = min(completed + batch_size, target)
+        batch_images = []
+        for index in range(completed, stop):
+            img = cv2.imread(str(paths[index]), cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"{paths[index].name} could not be read as an image.")
+            if (img.shape[1], img.shape[0]) != size:
+                img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+            img, _ = to_web_jpeg(img, sdir / f"{index:06d}.jpg")
+            batch_images.append(img)
+
+        batch_started = time.monotonic()
+        batch_detections = detector.detect(batch_images, batch=batch_size)
+        detection_seconds = time.monotonic() - batch_started
+        if len(batch_detections) != len(batch_images):
+            raise RuntimeError("The detector returned a different number of results than input frames.")
+        chunk_name = f"detections-{completed:06d}-{stop:06d}.json"
+        _write_json_atomic(sdir / chunk_name, batch_detections)
+        detections.extend(batch_detections)
+        completed = stop
+        manifest["chunks"].append({"start": stop - len(batch_detections), "stop": stop, "file": chunk_name})
+        manifest["completed_frames"] = completed
+        manifest["size"] = size
+        manifest["detection_seconds"] = float(manifest.get("detection_seconds", 0.0)) + detection_seconds
+        pilot_frames = max(0, min(stop, 1000) - (stop - len(batch_detections)))
+        if pilot_frames:
+            manifest["pilot_detection_seconds"] = (
+                float(manifest.get("pilot_detection_seconds", 0.0))
+                + detection_seconds * pilot_frames / len(batch_detections)
+            )
+        _write_json_atomic(manifest_path, manifest)
+        if progress:
+            progress(completed / target, f"Detected {completed:,}/{target:,} frames")
+
+    selected_paths = paths[:target]
+    selected_detections = detections[:target]
+    selected_frame_numbers = frame_numbers[:target]
+    elapsed = time.monotonic() - started
+    return {
+        "id": cache_id,
+        "source_fingerprint": fingerprint,
+        "source_folder": str(root),
+        "names": [p.name for p in selected_paths],
+        "frame_numbers": selected_frame_numbers,
+        "detections": selected_detections,
+        "urls": [url_for(sdir / f"{i:06d}.jpg") for i in range(target)],
+        "size": size,
+        "fps": None,
+        "kind": "local-images",
+        "scope": "pilot" if target < len(paths) else "full",
+        "processed_images": target,
+        "dataset_images": len(paths),
+        "detection_seconds": float(manifest.get("detection_seconds", 0.0)),
+        "pilot_detection_seconds": float(manifest.get("pilot_detection_seconds", 0.0)),
+        "elapsed_seconds": elapsed,
+        "cached_images": cached_images,
+    }
 
 
 def load_uploaded_video(data: bytes, suffix: str, detector: SlugDetector, step: int = 1,
@@ -243,5 +439,5 @@ def inline_frames(payload: Dict) -> Dict:
 
 
 def render_player_html(payload: Dict) -> str:
-    tpl = (Path(__file__).parent / "player.html").read_text()
+    tpl = (Path(__file__).parent / "player.html").read_text(encoding="utf-8")
     return tpl.replace("__DATA__", json.dumps(payload, separators=(",", ":")))

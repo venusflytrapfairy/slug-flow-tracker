@@ -11,11 +11,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from slugtrack.pipeline import (WEIGHTS, analyse, inline_frames, load_demo, load_uploaded_images,
-                                load_uploaded_video, player_payload, render_player_html)
+from slugtrack.pipeline import (WEIGHTS, analyse, inline_frames, load_demo, load_local_image_folder,
+                                load_uploaded_images, load_uploaded_video, player_payload,
+                                render_player_html, scan_image_folder)
 from slugtrack.tracker import TrackerConfig
 
 MIN_IMAGES = 125
+PILOT_IMAGES = 1000
 DEFAULT_PX_PER_CM = 11.0
 
 st.set_page_config(page_title="Slug flow tracker", page_icon="🌊", layout="wide")
@@ -45,9 +47,9 @@ section[data-testid="stSidebar"] h3 { font-stretch: 110%; font-weight: 700; marg
 
 
 @st.cache_resource(show_spinner=False)
-def get_detector():
+def get_detector(device="cpu"):
     from slugtrack.detector import SlugDetector
-    return SlugDetector(WEIGHTS)
+    return SlugDetector(WEIGHTS, device=device)
 
 
 @st.cache_data(show_spinner=False)
@@ -58,11 +60,16 @@ def get_demo():
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.markdown("### Footage")
-    source = st.radio("Footage", ["Sampled lab frames (500)", "Upload images", "Upload video"],
+    source = st.radio("Footage", ["Sampled lab frames (500)", "Upload images",
+                                  "Local image folder", "Upload video"],
                       label_visibility="collapsed")
 
     run = False
     files = video = None
+    folder_path = ""
+    folder_paths = []
+    folder_fingerprint = None
+    inference_device = "cpu"
     step = 1
     if source == "Upload images":
         files = st.file_uploader(
@@ -75,6 +82,56 @@ with st.sidebar:
             st.caption(f"{n_files} added. Add {MIN_IMAGES - n_files} more to run tracking.")
         run = st.button("Track slugs", type="primary", disabled=n_files < MIN_IMAGES,
                         width="stretch")
+    elif source == "Local image folder":
+        folder_path = st.text_input(
+            "Absolute image folder path",
+            placeholder=r"C:\Users\Name\Desktop\slug_frames",
+            help="Enter a folder on the computer running this app. Images in subfolders are not included.",
+        ).strip()
+        folder_error = None
+        if folder_path:
+            try:
+                root, folder_paths, folder_fingerprint = scan_image_folder(folder_path)
+                folder_path = str(root)
+            except ValueError as exc:
+                folder_error = str(exc)
+                st.error(folder_error)
+        if folder_paths:
+            st.caption(
+                f"Found {len(folder_paths):,} images · sorted from "
+                f"{folder_paths[0].name} to {folder_paths[-1].name}."
+            )
+        elif folder_path and not folder_error:
+            st.warning("No supported images found in that folder.")
+
+        scope = st.radio("Processing stage", ["Pilot (first 1,000)", "Full dataset"])
+        batch_size = st.select_slider("Inference batch size", options=[1, 2, 4, 8, 16], value=8,
+                                      help="Lower this if inference runs out of memory.")
+        import torch
+        cuda_available = torch.cuda.is_available()
+        device_options = ["CPU"] + (["GPU (CUDA)"] if cuda_available else [])
+        device_label = st.selectbox("Inference device", device_options)
+        inference_device = "0" if device_label == "GPU (CUDA)" else "cpu"
+        if not cuda_available:
+            st.caption("CUDA GPU not detected; CPU inference is selected.")
+
+        selected_count = (min(PILOT_IMAGES, len(folder_paths))
+                          if scope == "Pilot (first 1,000)" else len(folder_paths))
+        if folder_paths and len(folder_paths) < MIN_IMAGES:
+            st.caption(f"At least {MIN_IMAGES} images are needed; found {len(folder_paths)}.")
+        elif selected_count:
+            if scope == "Pilot (first 1,000)":
+                st.caption(f"Pilot will process {selected_count:,} image(s).")
+            else:
+                st.caption(f"Full run will process all {selected_count:,} image(s).")
+        button_label = ("Run 1,000-image pilot"
+                        if scope == "Pilot (first 1,000)" else "Process full dataset")
+        run = st.button(
+            button_label,
+            type="primary",
+            disabled=(len(folder_paths) < MIN_IMAGES or folder_fingerprint is None),
+            width="stretch",
+        )
     elif source == "Upload video":
         video = st.file_uploader("Video file", type=["mp4", "avi", "mov", "mkv"])
         step = st.slider("Analyse every Nth frame", 1, 10, 1,
@@ -116,19 +173,29 @@ if run:
     try:
         if source == "Upload images":
             st.session_state["src"] = load_uploaded_images(files, get_detector(), cb)
+        elif source == "Local image folder":
+            limit = PILOT_IMAGES if scope == "Pilot (first 1,000)" else None
+            st.session_state["src"] = load_local_image_folder(
+                folder_path, get_detector(inference_device), limit=limit,
+                batch_size=batch_size, progress=cb,
+            )
         else:
             st.session_state["src"] = load_uploaded_video(video.getvalue(), Path(video.name).suffix,
                                                           get_detector(), step=step, progress=cb)
         st.session_state["src_kind"] = source
         bar.empty()
         st.rerun()
-    except ValueError as e:
+    except (ValueError, OSError, RuntimeError) as e:
         bar.empty()
         st.error(str(e))
 
 if source == "Sampled lab frames (500)":
     with st.spinner("Loading the sampled frames"):
         src = get_demo()
+elif (source == "Local image folder" and folder_fingerprint is not None
+      and st.session_state.get("src_kind") == source
+      and st.session_state.get("src", {}).get("source_fingerprint") == folder_fingerprint):
+    src = st.session_state["src"]
 elif st.session_state.get("src_kind") == source:
     src = st.session_state["src"]
 else:
@@ -143,6 +210,8 @@ st.markdown('<p class="lede">Your YOLOv8 model finds the slug body in every fram
 if src is None:
     if source == "Upload images":
         st.markdown(f"Add at least {MIN_IMAGES} frames in the sidebar, then choose **Track slugs**.")
+    elif source == "Local image folder":
+        st.markdown("Choose a local image folder in the sidebar, then run a pilot before processing the full dataset.")
     else:
         st.markdown("Add a video in the sidebar, then choose **Track slugs**.")
     st.stop()
@@ -152,10 +221,29 @@ m, tr = result["metrics"], result["track"]
 
 if src["kind"] == "video" and src.get("truncated"):
     st.warning("Only the first 1,500 analysed frames were used. Raise “Analyse every Nth frame” to cover the whole video.")
+if src["kind"] == "local-images":
+    if src["scope"] == "pilot":
+        pilot_count = src["processed_images"]
+        estimate = src["pilot_detection_seconds"] * src["dataset_images"] / pilot_count
+        st.info(
+            f"Pilot: {pilot_count:,} of {src['dataset_images']:,} images. "
+            f"Detection took {src['pilot_detection_seconds'] / 60:.1f} min; "
+            f"estimated full detection time is about {estimate / 60:.1f} min. "
+            "Review the pilot, then choose **Full dataset** to continue; cached pilot detections will be reused."
+        )
+    else:
+        st.info(
+            f"Full dataset: {src['processed_images']:,} images. "
+            f"{src['cached_images']:,} detections reused from the saved cache. "
+            f"Total recorded detection time: {src['detection_seconds'] / 60:.1f} min."
+        )
 
 payload = player_payload(src, result, px_per_cm, fps)
 if not st.get_option("server.enableStaticServing"):
-    # .streamlit/config.toml missing: still works, just loads slower.
+    if src["kind"] == "local-images":
+        st.error("Local-folder playback requires server.enableStaticServing=true in .streamlit/config.toml.")
+        st.stop()
+    # Small uploads can fall back to inline frames when static serving is disabled.
     payload = inline_frames(payload)
 st.iframe(render_player_html(payload), height="content")
 

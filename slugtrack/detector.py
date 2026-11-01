@@ -25,6 +25,10 @@ class SlugDetector:
     """Thin wrapper around an Ultralytics YOLO model with one class, 'slug'."""
 
     def __init__(self, weights: str | Path, imgsz: int = 640, device: str = "cpu"):
+        if device != "cpu":
+            import torch
+            if not torch.cuda.is_available():
+                raise ValueError("CUDA was selected, but no CUDA-enabled PyTorch GPU is available.")
         from ultralytics import YOLO  # imported lazily: heavy
         self.model = YOLO(str(weights))
         self.imgsz = imgsz

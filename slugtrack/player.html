@@ -127,23 +127,58 @@ document.getElementById("total").textContent = D.slugs.length;
 const firstIdx = D.slugs.map(s => s.first_idx);
 const soFarAt = i => firstIdx.filter(f => f <= i).length;
 
-// ---------- image preloading ----------
-const imgs = new Array(N); let loaded = 0;
+// ---------- nearby-frame loading ----------
+const imgs = new Array(N), pending = new Set();
 const bufEl = document.getElementById("buffer");
-function loadImg(i) {
-  const im = new Image();
-  im.decoding = "async";
-  im.onload = () => { loaded++; bufEl.textContent = loaded < N ? `Loading frames ${loaded}/${N}` : ""; if (i === cur) draw(); };
-  im.onerror = () => { if (!im.dataset.retry) { im.dataset.retry = 1; im.src = "/" + D.frames[i].url; } };
-  im.src = D.frames[i].url;
-  imgs[i] = im;
-}
-for (let i = 0; i < N; i++) loadImg(i);
-
-// ---------- state ----------
 let cur = 0, playing = false, last = 0;
 const KEY = "slugplayer:" + D.dataset_id;
 try { const s = localStorage.getItem(KEY); if (s !== null) cur = Math.min(+s, N - 1) || 0; } catch (e) {}
+
+function loadImg(i) {
+  if (i < 0 || i >= N || imgs[i] || pending.has(i)) return;
+  const im = new Image();
+  im.decoding = "async";
+  pending.add(i);
+  im.onload = () => {
+    if (imgs[i] !== im) return;
+    pending.delete(i);
+    if (i === cur) draw();
+  };
+  im.onerror = () => {
+    if (imgs[i] !== im) return;
+    if (!im.dataset.retry) {
+      im.dataset.retry = 1;
+      im.src = "/" + D.frames[i].url;
+    } else {
+      pending.delete(i);
+      if (i === cur) bufEl.textContent = `Could not load frame ${i + 1}`;
+    }
+  };
+  im.src = D.frames[i].url;
+  imgs[i] = im;
+}
+
+function loadNearby(center) {
+  const first = Math.max(0, center - 2), last = Math.min(N - 1, center + 8);
+  for (const key of Object.keys(imgs)) {
+    const index = +key;
+    if (index < first || index > last) {
+      if (pending.has(index)) {
+        pending.delete(index);
+        imgs[index].onload = null;
+        imgs[index].onerror = null;
+        imgs[index].src = "data:,";
+      }
+      imgs[index] = null;
+    }
+  }
+  for (let i = first; i <= last; i++) loadImg(i);
+  if (!imgs[center] || !imgs[center].complete) {
+    bufEl.textContent = `Loading frame ${center + 1}/${N}`;
+  } else {
+    bufEl.textContent = pending.size ? `Buffering nearby frames (${pending.size})` : "";
+  }
+}
 
 const view = document.getElementById("view"), vctx = view.getContext("2d");
 const kymo = document.getElementById("kymo"), kctx = kymo.getContext("2d");
@@ -158,6 +193,7 @@ function fitCanvas(c) {
 
 // ---------- frame view ----------
 function draw() {
+  loadNearby(cur);
   const dpr = fitCanvas(view);
   const cw = view.width, ch = view.height, sx = cw / W, sy = ch / H;
   vctx.clearRect(0, 0, cw, ch);
@@ -354,7 +390,8 @@ function tick(t) {
     const nxt = cur + 1;
     if (nxt >= N) { setPlaying(false); return; }
     const im = imgs[nxt];
-    if (im && im.complete) { cur = nxt; last = t; draw(); }
+    if (im && im.complete && im.naturalWidth) { cur = nxt; last = t; draw(); }
+    else loadImg(nxt);
   }
   requestAnimationFrame(tick);
 }
