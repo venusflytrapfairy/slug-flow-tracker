@@ -1,10 +1,10 @@
-"""Synthetic checks of the slug tracker. Run: python -m pytest -q"""
+"""Checks of the slug tracker. Run: python -m pytest -q"""
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from slugtrack.metrics import compute_metrics          # noqa: E402
-from slugtrack.tracker import TrackerConfig, track_slugs  # noqa: E402
+from slugtrack.tracker import TrackerConfig, merge_frame, track_slugs  # noqa: E402
 
 W = 960
 
@@ -19,10 +19,7 @@ def passage(n_frames, speed=6.0, start=W - 20, length=500):
     for k in range(n_frames):
         front = start - speed * k
         tail = front + length if front + length < W else W
-        if tail <= 0:
-            out.append([])
-        else:
-            out.append([slug_box(front, tail)])
+        out.append([] if tail <= 0 else [slug_box(front, tail)])
     return out
 
 
@@ -31,9 +28,45 @@ def run(dets, frames=None, **kw):
     return track_slugs(frames, dets, W, TrackerConfig(**kw))
 
 
+def max_slugs_in_any_frame(r):
+    return max((len(row) for row in r["per_frame"]), default=0)
+
+
+# ---------------------------------------------------------------- one slug per frame
+def test_two_boxes_in_one_frame_become_one_slug_box():
+    d = [[slug_box(300, 500, 0.8), slug_box(600, 900, 0.6)] for _ in range(20)]
+    r = run(d)
+    assert len(r["slugs"]) == 1
+    assert max_slugs_in_any_frame(r) == 1
+    box = r["per_frame"][0][0]
+    assert (box["x1"], box["x2"], box["conf"], box["merged"]) == (300, 900, 0.8, 2)
+    assert r["slugs"][0]["frames_with_merged_boxes"] == 20
+
+
+def test_low_confidence_extra_box_is_not_merged():
+    box = merge_frame([slug_box(300, 500, 0.9), slug_box(700, 900, 0.2)], conf=0.4)
+    assert (box["x1"], box["x2"], box["merged"]) == (300, 500, 1)
+
+
+def test_new_front_on_the_right_without_a_break_is_still_one_slug():
+    # A second front entering while the first is in view used to count as a new
+    # slug. Without frames free of slug in between, it is the same slug.
+    first = passage(170, length=300)
+    second = [[] for _ in range(110)] + passage(60, length=300)
+    d = [a + b for a, b in zip(first, second)]
+    r = run(d)
+    assert len(r["slugs"]) == 1
+    assert max_slugs_in_any_frame(r) == 1
+
+
+def test_front_jump_without_break_is_same_slug():
+    d = passage(80, speed=12, length=900) + [[slug_box(820)] for _ in range(20)]
+    assert len(run(d)["slugs"]) == 1
+
+
+# ---------------------------------------------------------------- interruptions
 def test_empty_sequence_counts_nothing():
-    r = run([[] for _ in range(125)])
-    assert r["slugs"] == []
+    assert run([[] for _ in range(125)])["slugs"] == []
 
 
 def test_one_passage_is_one_slug_with_right_speed():
@@ -42,49 +75,42 @@ def test_one_passage_is_one_slug_with_right_speed():
     assert abs(r["slugs"][0]["front_velocity_px_per_frame"] + 6.0) < 0.2
 
 
-def test_missed_detections_inside_a_slug_are_bridged():
-    d = passage(100)
-    for k in (30, 31, 60):
-        d[k] = []
-    assert len(run(d, gap_tolerance=3)["slugs"]) == 1
-
-
-def test_long_dropout_splits_when_tolerance_is_small():
-    d = passage(100)
-    for k in range(40, 50):
-        d[k] = []
-    # with gap tolerance 3 the front is re-acquired within the position tolerance
-    # only if the motion prediction holds; a 10-frame dropout should still match.
-    assert len(run(d, gap_tolerance=12)["slugs"]) == 1
-
-
 def test_two_slugs_separated_by_liquid_film():
     d = passage(60) + [[] for _ in range(30)] + passage(60)
     r = run(d)
     assert [s["slug"] for s in r["slugs"]] == [1, 2]
+    assert max_slugs_in_any_frame(r) == 1
 
 
-def test_new_slug_entering_while_previous_still_in_view():
-    first = passage(170, length=300)
-    second = [[] for _ in range(110)] + passage(60, length=300)
-    d = [a + b for a, b in zip(first, second)]
-    r = run(d)
-    assert len(r["slugs"]) == 2
-    both = [row for row in r["per_frame"] if len(row) == 2]
-    assert both, "expected frames with both slugs in view"
+def test_short_dropout_is_a_missed_detection_not_a_new_slug():
+    d = passage(100)
+    for k in (30, 31, 60):
+        d[k] = []
+    r = run(d, gap_tolerance=3)
+    assert len(r["slugs"]) == 1
+    assert r["active"][30] == r["active"][31] == 1      # bridged frames still belong to slug 1
 
 
-def test_new_slug_arriving_as_previous_tail_leaves():
-    # front of slug 1 has left the view, its tail still visible; slug 2 appears right
-    d = passage(80, speed=12, length=900)
-    d += [[slug_box(820)] for _ in range(20)]
-    assert len(run(d)["slugs"]) == 2
+def test_dropout_longer_than_tolerance_is_an_interruption():
+    d = passage(100)
+    for k in range(40, 45):                              # 5 empty frames
+        d[k] = []
+    assert len(run(d, gap_tolerance=3)["slugs"]) == 2
+    assert len(run(d, gap_tolerance=5)["slugs"]) == 1
+
+
+def test_strict_mode_any_empty_frame_interrupts():
+    d = passage(60)
+    d[30] = []
+    assert len(run(d, gap_tolerance=0)["slugs"]) == 2
 
 
 def test_single_frame_false_alarm_is_ignored():
     d = [[] for _ in range(50)]
     d[20] = [slug_box(500, 700, conf=0.95)]
-    assert run(d, min_frames=3)["slugs"] == []
+    r = run(d, min_frames=3)
+    assert r["slugs"] == []
+    assert r["rejected"][20]
 
 
 def test_low_confidence_is_filtered():
@@ -93,6 +119,7 @@ def test_low_confidence_is_filtered():
     assert len(run(d, conf=0.1)["slugs"]) == 1
 
 
+# ---------------------------------------------------------------- frame-number gaps
 def test_large_frame_jump_starts_a_new_interval():
     d = passage(40) + passage(40)
     frames = list(range(40)) + list(range(1000, 1040))
@@ -102,13 +129,14 @@ def test_large_frame_jump_starts_a_new_interval():
     assert r["slugs"][0]["cut_at_end"] and r["slugs"][1]["cut_at_start"]
 
 
-def test_small_frame_jump_is_bridged_by_motion():
+def test_missing_frame_numbers_are_not_an_interruption():
     full = passage(120)
-    keep = [k for k in range(120) if not (40 <= k < 60)]   # 20 missing frame numbers
+    keep = [k for k in range(120) if not (40 <= k < 60)]   # 20 frame numbers never observed
     r = run([full[k] for k in keep], frames=keep, max_bridge=30)
     assert len(r["slugs"]) == 1
 
 
+# ---------------------------------------------------------------- metrics
 def test_metrics_frame_based_and_with_fps():
     d = passage(60) + [[] for _ in range(40)] + passage(60)
     r = run(d)

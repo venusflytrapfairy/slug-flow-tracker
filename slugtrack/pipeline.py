@@ -414,8 +414,9 @@ def player_payload(src: Dict, result: Dict, px_per_cm: float, fps: Optional[floa
     for i, url in enumerate(src["urls"]):
         frames.append({
             "url": url, "frame": src["frame_numbers"][i], "segment": segs[i],
-            "boxes": [{k: b[k] for k in ("x1", "y1", "x2", "y2", "conf", "slug")}
+            "boxes": [{k: b[k] for k in ("x1", "y1", "x2", "y2", "conf", "slug", "merged")}
                       for b in tr["per_frame"][i]],
+            "active": tr["active"][i],
             "rejected": len(tr["rejected"][i]),
         })
     slugs = [{k: s[k] for k in ("slug", "first_idx", "last_idx", "first_frame", "last_frame",

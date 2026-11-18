@@ -94,14 +94,16 @@ from the ruler (centimetre scale) in the 960×480 lab frames; change it for othe
 
 ## How tracking and counting work
 
-- Flow runs right to left, so the left edge of each detection box is the slug **front**.
-- Each front is followed with a constant-velocity (alpha-beta) filter. A new box is matched to the front it
-  best continues; a box whose front appears somewhere unexpected, usually back on the right, is a new slug.
-- Counting follows the annotation rule: consecutive frames showing a slug are one slug; a slug that reappears
-  after frames without one is a new slug. Up to 3 missed detections are tolerated (adjustable), and a track
-  must last 3 frames to count.
-- File names are read as frame numbers. Gaps of up to 30 missing frame numbers are crossed using the predicted
-  front position; longer gaps split the footage into separate intervals.
+- **One slug per frame.** Slug flow is one continuous stream, so a frame can show at most one slug. If the model
+  draws more than one box in a frame, the boxes are merged into one box covering all of them.
+- **Counting** follows the annotation rule: consecutive frames with a slug are one slug, and a new slug is
+  counted only after frames with no slug interrupt the sequence. Up to 3 empty frames inside a slug are treated
+  as missed detections (adjustable; 0 makes every empty frame an interruption), and a slug must be detected in
+  at least 3 frames to count.
+- File names are read as frame numbers. Gaps of up to 30 missing frame numbers are not treated as interruptions
+  (those frames were never observed); longer gaps split the footage into separate intervals.
+- Flow runs right to left, so the left edge of each box is the slug **front**; its speed is a straight-line fit
+  of front position against frame number.
 
 ## About the bundled 500 frames
 

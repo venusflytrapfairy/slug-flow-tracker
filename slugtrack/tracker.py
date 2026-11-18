@@ -1,78 +1,54 @@
-"""Slug-front tracker and slug counting.
+"""Slug tracking and counting: at most one slug per frame.
 
-Physical idea
+Physical rule
 -------------
-Flow runs right -> left in the camera view, so every slug enters on the right
-and its *leading edge* (the "front": the left edge x1 of the detection box)
-travels steadily leftwards. Tracking that front gives
+Slug flow is one continuous stream through the pipe, so a frame can show at
+most one slug. A new slug is counted only after the previous one has ended,
+i.e. after one or more frames in which no slug is detected. This is the same
+rule used when the frames were annotated:
 
-* identity : a detection whose front sits where the previous slug's front was
-             predicted to be is the same slug; a front that shows up somewhere
-             else (typically back on the right) is a new slug;
-* velocity : pixels per frame travelled by the front (translational velocity);
-* extent   : the visible length of the slug body (box width).
+* consecutive frames containing a slug belong to the same slug;
+* when frames without a slug interrupt the sequence, the next appearance of a
+  slug is a new slug.
 
-Mechanics: an alpha-beta (constant-velocity) filter on the front position and
-greedy, cost-ordered association. Frames carry *frame numbers*, which may jump
-in sampled data; jumps up to `max_bridge` are bridged with the motion model,
-longer jumps start an independent segment (all tracks are closed).
+How detections become slugs
+---------------------------
+1. One box per frame. YOLO can return more than one box in a frame (for
+   example two pieces of the same slug). All boxes above the confidence
+   threshold are merged into a single box covering all of them (their union),
+   with the highest confidence. The number of merged boxes is kept so it can be
+   reported.
+2. Slug events. Frames with a box are grouped into runs. A run continues across
+   up to `gap_tolerance` frames without a box (missed detections); a longer
+   break ends the slug, and the next box starts a new one. Set
+   `gap_tolerance` to 0 to treat every empty frame as an interruption.
+3. Noise. A run with fewer than `min_frames` detections is not counted.
+4. Missing frame numbers. In sampled image sets the file numbers can jump.
+   Jumps of up to `max_bridge` frame numbers are not evidence of an
+   interruption (those frames were not observed), so they do not end a slug.
+   Longer jumps split the footage into separate intervals; a slug never
+   continues across intervals.
 
-Counting rule (matches the annotation rule used for the dataset): consecutive
-frames showing the same slug are one slug; a slug may go undetected for up to
-`gap_tolerance` images (missed detections) and still be the same slug; a slug
-must be seen in at least `min_frames` images to be counted.
+The slug front (the left edge of the box, since flow runs right to left) is
+recorded in every frame and its speed is fitted per slug.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 
 @dataclass
 class TrackerConfig:
     conf: float = 0.40          # minimum detection confidence
-    gap_tolerance: int = 3      # images a slug may be missed before its track closes
-    min_frames: int = 3         # detections needed before a track counts as a slug
-    max_bridge: int = 30        # largest jump in frame numbers bridged by the motion model
-    match_tol: float = 0.18     # allowed front-position error (fraction of frame width)
-    alpha: float = 0.6          # position smoothing of the alpha-beta filter
-    beta: float = 0.3           # velocity smoothing of the alpha-beta filter
+    gap_tolerance: int = 3      # empty frames allowed inside one slug (missed detections)
+    min_frames: int = 3         # detections needed before a run counts as a slug
+    max_bridge: int = 30        # largest jump in frame numbers that does not split the footage
     edge_margin: int = 6        # px; a box this close to a frame edge is cut by the edge
 
 
-@dataclass
-class Track:
-    tid: int
-    segment: int
-    first_idx: int
-    front: float                          # filtered front position (px)
-    vel: float = 0.0                      # px per frame (negative = moving left)
-    last_idx: int = 0
-    last_frame: int = 0
-    misses: int = 0
-    frames: List[int] = field(default_factory=list)
-    idxs: List[int] = field(default_factory=list)
-    fronts: List[float] = field(default_factory=list)
-    widths: List[float] = field(default_factory=list)
-    confs: List[float] = field(default_factory=list)
-    entered_from_right: bool = False
-    exited_left: bool = False
-    cut_at_start: bool = False
-    cut_at_end: bool = False
-
-    def add(self, i: int, fnum: int, d: dict, edge: int) -> None:
-        self.last_idx, self.last_frame, self.misses = i, fnum, 0
-        self.frames.append(fnum)
-        self.idxs.append(i)
-        self.fronts.append(d["x1"])
-        self.widths.append(d["x2"] - d["x1"])
-        self.confs.append(d["conf"])
-        if d["x1"] <= edge:
-            self.exited_left = True
-
-
 def segment_ids(frame_numbers: List[int], max_bridge: int) -> List[int]:
-    """Segment id per image; a new segment starts after a jump > max_bridge."""
+    """Interval id per image; a new interval starts after a jump > max_bridge."""
     seg, out = 0, []
     for i, f in enumerate(frame_numbers):
         if i > 0 and f - frame_numbers[i - 1] > max_bridge:
@@ -81,104 +57,85 @@ def segment_ids(frame_numbers: List[int], max_bridge: int) -> List[int]:
     return out
 
 
+def merge_frame(dets: List[dict], conf: float) -> Optional[dict]:
+    """Merge all boxes at or above `conf` into one slug box (or None)."""
+    kept = [d for d in dets if d["conf"] >= conf]
+    if not kept:
+        return None
+    return {
+        "x1": min(d["x1"] for d in kept),
+        "y1": min(d["y1"] for d in kept),
+        "x2": max(d["x2"] for d in kept),
+        "y2": max(d["y2"] for d in kept),
+        "conf": max(d["conf"] for d in kept),
+        "merged": len(kept),
+    }
+
+
 def track_slugs(frame_numbers: List[int], detections: List[List[dict]],
                 width: int, cfg: TrackerConfig) -> Dict:
-    """Track slug fronts through a sequence.
+    """Group per-frame detections into slugs (at most one per frame).
 
     frame_numbers : time index of each image (ascending).
     detections    : per image, list of {"x1","y1","x2","y2","conf"} in pixels.
     width         : frame width in px.
 
-    Returns {"per_frame": [[det + {"slug": id}]], "slugs": [summary], "segments": [id]}.
+    Returns
+      per_frame : per image, [] or [box + {"slug": id, "merged": n}]
+      active    : per image, the slug id in progress (also on bridged empty frames) or None
+      rejected  : per image, [] or [box] for runs too short to count
+      slugs     : summary per counted slug
+      segments  : interval id per image
     """
     n = len(frame_numbers)
     segs = segment_ids(frame_numbers, cfg.max_bridge)
-    tol = cfg.match_tol * width
-    edge = cfg.edge_margin
-    right_edge = width - edge
+    boxes = [merge_frame(d, cfg.conf) for d in detections]
 
-    all_tracks: List[Track] = []
-    active: List[Track] = []
-    raw_assign: List[List[dict]] = [[] for _ in range(n)]
-    next_id = 1
-
+    # ---- group frames into runs ------------------------------------------
+    runs: List[dict] = []
+    cur: Optional[dict] = None
+    misses = 0
     for i in range(n):
-        fnum = frame_numbers[i]
         new_segment = i == 0 or segs[i] != segs[i - 1]
-        if new_segment and active:
-            for t in active:
-                t.cut_at_end = True
-            active = []
+        if new_segment and cur is not None:
+            cur["cut_at_end"] = True          # still in view when the interval ended
+            runs.append(cur)
+            cur = None
+        if boxes[i] is not None:
+            if cur is None:
+                cur = {"idxs": [], "segment": segs[i], "cut_at_start": new_segment,
+                       "cut_at_end": False}
+            cur["idxs"].append(i)
+            misses = 0
+        elif cur is not None:
+            misses += 1
+            if misses > cfg.gap_tolerance:    # a real interruption: the slug has ended
+                runs.append(cur)
+                cur = None
+    if cur is not None:
+        cur["cut_at_end"] = True
+        runs.append(cur)
 
-        dets = sorted((d for d in detections[i] if d["conf"] >= cfg.conf),
-                      key=lambda d: d["x1"])
+    # ---- keep runs long enough to be a slug -------------------------------
+    per_frame: List[List[dict]] = [[] for _ in range(n)]
+    rejected: List[List[dict]] = [[] for _ in range(n)]
+    active: List[Optional[int]] = [None] * n
+    slugs: List[dict] = []
+    for run in runs:
+        idxs = run["idxs"]
+        if len(idxs) < cfg.min_frames:
+            for i in idxs:
+                rejected[i].append(boxes[i])
+            continue
+        sid = len(slugs) + 1
+        for i in idxs:
+            per_frame[i].append({**boxes[i], "slug": sid})
+        for i in range(idxs[0], idxs[-1] + 1):
+            active[i] = sid
+        slugs.append(_summarise(sid, run, boxes, frame_numbers, width, cfg))
 
-        # Candidate (track, detection) pairs ordered by front-position error.
-        pairs = []
-        for ti, t in enumerate(active):
-            dt = max(fnum - t.last_frame, 1)
-            pred = max(t.front + t.vel * dt, 0.0)
-            allowed = tol + abs(t.vel) * (dt - 1)
-            for di, d in enumerate(dets):
-                err = abs(d["x1"] - pred)
-                if err <= allowed:
-                    pairs.append((err, ti, di))
-        pairs.sort()
-
-        used_t, used_d = set(), set()
-        for _, ti, di in pairs:
-            if ti in used_t or di in used_d:
-                continue
-            used_t.add(ti)
-            used_d.add(di)
-            t, d = active[ti], dets[di]
-            dt = max(fnum - t.last_frame, 1)
-            pred = max(t.front + t.vel * dt, 0.0)
-            resid = d["x1"] - pred
-            t.front = pred + cfg.alpha * resid
-            if d["x1"] > edge:                     # front still visible: update velocity
-                t.vel += cfg.beta * resid / dt
-            t.add(i, fnum, d, edge)
-            raw_assign[i].append({**d, "tid": t.tid})
-
-        # Unmatched tracks accumulate misses.
-        for ti, t in enumerate(active):
-            if ti not in used_t:
-                t.misses += 1
-
-        # Unmatched detections start new tracks.
-        for di, d in enumerate(dets):
-            if di in used_d:
-                continue
-            t = Track(tid=next_id, segment=segs[i], first_idx=i, front=d["x1"])
-            next_id += 1
-            t.entered_from_right = d["x2"] >= right_edge and d["x1"] > width * 0.5
-            t.cut_at_start = new_segment
-            t.add(i, fnum, d, edge)
-            all_tracks.append(t)
-            active.append(t)
-            raw_assign[i].append({**d, "tid": t.tid})
-
-        # Close tracks missed for too long; flag tracks still open at segment end.
-        last_of_segment = i == n - 1 or segs[i + 1] != segs[i]
-        kept = []
-        for t in active:
-            if t.misses > cfg.gap_tolerance:
-                continue
-            if last_of_segment:
-                t.cut_at_end = True
-            kept.append(t)
-        active = kept
-
-    confirmed = sorted((t for t in all_tracks if len(t.frames) >= cfg.min_frames),
-                       key=lambda t: (t.first_idx, t.fronts[0]))
-    relabel = {t.tid: k + 1 for k, t in enumerate(confirmed)}
-
-    per_frame = [[{**d, "slug": relabel[d["tid"]]} for d in row if d["tid"] in relabel]
-                 for row in raw_assign]
-    rejected = [[d for d in row if d["tid"] not in relabel] for row in raw_assign]
-    slugs = [_summarise(t, relabel[t.tid], cfg) for t in confirmed]
-    return {"per_frame": per_frame, "rejected": rejected, "slugs": slugs, "segments": segs}
+    return {"per_frame": per_frame, "active": active, "rejected": rejected,
+            "slugs": slugs, "segments": segs}
 
 
 def _fit_velocity(frames: List[int], fronts: List[float], edge: int) -> Optional[float]:
@@ -195,24 +152,28 @@ def _fit_velocity(frames: List[int], fronts: List[float], edge: int) -> Optional
     return sum((f - fm) * (x - xm) for f, x in zip(fs, xs)) / den
 
 
-def _summarise(t: Track, sid: int, cfg: TrackerConfig) -> dict:
+def _summarise(sid: int, run: dict, boxes, frame_numbers, width: int, cfg: TrackerConfig) -> dict:
+    idxs = run["idxs"]
+    frames = [frame_numbers[i] for i in idxs]
+    fronts = [boxes[i]["x1"] for i in idxs]
+    first = boxes[idxs[0]]
     return {
         "slug": sid,
-        "segment": t.segment,
-        "first_frame": t.frames[0],
-        "last_frame": t.frames[-1],
-        "frames_detected": len(t.frames),
-        "span_frames": t.frames[-1] - t.frames[0] + 1,
-        "front_velocity_px_per_frame": _fit_velocity(t.frames, t.fronts, cfg.edge_margin),
-        "max_extent_px": max(t.widths),
-        "mean_conf": sum(t.confs) / len(t.confs),
-        "entered_from_right": t.entered_from_right,
-        "exited_left": t.exited_left,
-        "cut_at_start": t.cut_at_start,
-        "cut_at_end": t.cut_at_end,
-        "complete": not t.cut_at_start and not t.cut_at_end,
-        "first_idx": t.idxs[0],
-        "last_idx": t.idxs[-1],
-        "track": [{"idx": i, "frame": f, "front": x}
-                  for i, f, x in zip(t.idxs, t.frames, t.fronts)],
+        "segment": run["segment"],
+        "first_idx": idxs[0],
+        "last_idx": idxs[-1],
+        "first_frame": frames[0],
+        "last_frame": frames[-1],
+        "frames_detected": len(idxs),
+        "span_frames": frames[-1] - frames[0] + 1,
+        "front_velocity_px_per_frame": _fit_velocity(frames, fronts, cfg.edge_margin),
+        "max_extent_px": max(boxes[i]["x2"] - boxes[i]["x1"] for i in idxs),
+        "mean_conf": sum(boxes[i]["conf"] for i in idxs) / len(idxs),
+        "frames_with_merged_boxes": sum(1 for i in idxs if boxes[i]["merged"] > 1),
+        "entered_from_right": first["x2"] >= width - cfg.edge_margin and first["x1"] > width * 0.5,
+        "exited_left": any(x <= cfg.edge_margin for x in fronts),
+        "cut_at_start": run["cut_at_start"],
+        "cut_at_end": run["cut_at_end"],
+        "complete": not run["cut_at_start"] and not run["cut_at_end"],
+        "track": [{"idx": i, "frame": f, "front": x} for i, f, x in zip(idxs, frames, fronts)],
     }

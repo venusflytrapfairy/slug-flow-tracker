@@ -262,14 +262,20 @@ function updateReadouts() {
     `Interval ${fr.segment + 1} of ${D.segments.length}: frames ${segInfo.first}–${segInfo.last}`;
   const inView = document.getElementById("inView"), conf = document.getElementById("conf");
   if (!fr.boxes.length) {
-    inView.textContent = "None"; conf.innerHTML = fr.rejected ? "Low-confidence box ignored" : "&nbsp;";
+    if (fr.active) {
+      inView.innerHTML = `<span class="chip"><span class="dot" style="background:${colorOf(fr.active)}"></span>Slug ${fr.active}</span>`;
+      conf.textContent = "Not detected in this frame; counted as a missed detection inside the same slug";
+    } else {
+      inView.textContent = "None"; conf.innerHTML = fr.rejected ? "Short detection ignored as noise" : "&nbsp;";
+    }
     document.getElementById("speed").textContent = "–"; document.getElementById("speed2").innerHTML = "&nbsp;";
     document.getElementById("len").textContent = "–";
     return;
   }
-  inView.innerHTML = fr.boxes.map(b => `<span class="chip"><span class="dot" style="background:${colorOf(b.slug)}"></span>Slug ${b.slug}</span>`).join(" ");
-  conf.textContent = `Detector confidence ${fr.boxes.map(b => b.conf.toFixed(2)).join(", ")}`;
   const b = fr.boxes[0], s = slugById[b.slug];
+  inView.innerHTML = `<span class="chip"><span class="dot" style="background:${colorOf(b.slug)}"></span>Slug ${b.slug}</span>`;
+  conf.textContent = `Detector confidence ${b.conf.toFixed(2)}` +
+    (b.merged > 1 ? `; ${b.merged} boxes merged into one slug` : "");
   const v = s.front_velocity_px_per_frame;
   if (v == null) {
     document.getElementById("speed").textContent = "Measuring";

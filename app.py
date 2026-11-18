@@ -144,7 +144,8 @@ with st.sidebar:
     conf = st.slider("Detector confidence threshold", 0.10, 0.90, 0.40, 0.05,
                      help="Detections below this score are ignored.")
     gap = st.slider("Missed frames allowed inside one slug", 0, 10, 3,
-                    help="A slug can go undetected for this many frames and still count as the same slug.")
+                    help="A slug can go undetected for this many frames and still count as the same slug. "
+                         "Set to 0 to count a new slug after any frame without a slug.")
     min_frames = st.slider("Frames needed to count a slug", 1, 15, 3,
                            help="Shorter detections are treated as noise.")
     max_bridge = st.number_input("Largest jump in frame numbers to bridge", 1, 500, 30,
@@ -295,6 +296,7 @@ for s in tr["slugs"]:
         "First frame": s["first_frame"],
         "Last frame": s["last_frame"],
         "Frames detected": s["frames_detected"],
+        "Frames where boxes were merged": s["frames_with_merged_boxes"],
         "Front velocity (cm/frame)": round(v_cm, 3) if v_cm is not None else None,
     }
     if fps:
@@ -321,7 +323,8 @@ for i, name in enumerate(src["names"]):
         "confidence": b["conf"] if b else None,
         "front_x_px": b["x1"] if b else None, "tail_x_px": b["x2"] if b else None,
         "visible_length_cm": round((b["x2"] - b["x1"]) / px_per_cm, 2) if b else None,
-        "boxes": len(boxes),
+        "detector_boxes_merged": b["merged"] if b else 0,
+        "bridged_missed_detection": (not boxes) and tr["active"][i] is not None,
     })
 frame_df = pd.DataFrame(frame_rows)
 
@@ -338,15 +341,19 @@ with tab3:
 **Detection.** The YOLOv8s model trained on the 500 annotated frames (mAP50 0.995, mAP50-95 0.888 on its
 validation split) draws a box around the slug body in each frame.
 
-**Tracking.** Flow runs right to left, so the left edge of each box is the slug front. The tracker keeps a
-constant-velocity estimate of every front and matches each new box to the front it best continues. A box whose
-front appears somewhere unexpected, usually back at the right edge, starts a new slug. Gaps in frame numbering
-of up to {int(max_bridge)} frames are crossed using the predicted front position; longer gaps split the footage
-into separate intervals.
+**One slug per frame.** Slug flow is one continuous stream, so a frame can show at most one slug. If the
+model draws more than one box in a frame (for example on two parts of the same slug), the boxes are merged
+into a single box covering all of them.
 
-**Counting.** One track is one slug, the same rule used when annotating: consecutive frames showing a slug are
-one slug, and a slug that reappears after frames without one is a new slug. Up to {gap} missed detections are
-tolerated, and a track must last at least {min_frames} frames to count.
+**Counting.** The same rule used when annotating: consecutive frames with a slug are one slug, and a new slug
+is counted only after frames with no slug interrupt the sequence. Up to {gap} empty frames inside a slug are
+treated as missed detections (set this to 0 to make every empty frame an interruption), and a slug must be
+detected in at least {min_frames} frames to count. Gaps of up to {int(max_bridge)} missing frame numbers are not
+treated as interruptions, since those frames were never observed; longer gaps split the footage into separate
+intervals.
+
+**Front speed.** Flow runs right to left, so the left edge of the box is the slug front. Its position is fitted
+against frame number for each slug.
 
 **Units without a frame rate.** Frequency is reported per 1000 frames and speed in cm per frame. Lengths use
 the ruler: {px_per_cm:g} px per cm. Enter the camera frame rate to convert to slugs per minute and cm/s.
